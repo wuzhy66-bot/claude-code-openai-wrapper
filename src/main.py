@@ -17,6 +17,13 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 import httpx
 from dotenv import load_dotenv
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
+
+try:
+    from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
+except ImportError:  # pragma: no cover - old SDK fallback
+    create_sdk_mcp_server = None
+    sdk_tool = None
 
 from src.models import (
     ChatCompletionRequest,
@@ -41,7 +48,7 @@ from src.models import (
     AnthropicTextBlock,
     AnthropicUsage,
 )
-from src.claude_cli import ClaudeCodeCLI
+from src.claude_cli import ClaudeCodeCLI, apply_claude_agent_reasoning_options
 from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
@@ -90,6 +97,814 @@ _model_list_cache: Dict[str, Any] = {"expires_at": 0.0, "models": None}
 # Serializes cache refreshes so concurrent /v1/models requests at TTL expiry
 # don't all stampede the upstream Anthropic API.
 _model_list_lock = asyncio.Lock()
+
+_deferred_tool_sessions: Dict[str, Dict[str, Any]] = {}
+_deferred_tool_clients: Dict[str, ClaudeSDKClient] = {}
+_deferred_tool_locks: Dict[str, asyncio.Lock] = {}
+_deferred_tool_store_path = os.getenv(
+    "DEFERRED_TOOL_STORE",
+    os.path.join(os.getenv("TMPDIR", "/tmp"), "deferred_tool_sessions.json"),
+)
+_deferred_tool_session_ttl_seconds = int(
+    os.getenv("DEFERRED_TOOL_SESSION_TTL_SECONDS", "900")
+)
+_deferred_tool_stream_heartbeat_seconds = float(
+    os.getenv("DEFERRED_TOOL_STREAM_HEARTBEAT_SECONDS", "15")
+)
+_deferred_tool_mirror_mode = os.getenv("DEFERRED_TOOL_MIRROR", "client").strip().lower()
+_deferred_client_tool_server_name = os.getenv(
+    "DEFERRED_CLIENT_TOOL_SERVER_NAME", "client"
+).strip()
+_deferred_client_platform = os.getenv("DEFERRED_CLIENT_PLATFORM", "").strip().lower()
+_deferred_client_tool_profile_path = os.getenv("DEFERRED_CLIENT_TOOL_PROFILE", "").strip()
+_deferred_client_tool_profile_mode = os.getenv(
+    "DEFERRED_CLIENT_TOOL_PROFILE_MODE", "fallback"
+).strip().lower()
+_deferred_client_tool_allowlist = {
+    item.strip()
+    for item in os.getenv("DEFERRED_CLIENT_TOOL_ALLOWLIST", "").split(",")
+    if item.strip()
+}
+_deferred_client_tool_denylist = {
+    item.strip()
+    for item in os.getenv("DEFERRED_CLIENT_TOOL_DENYLIST", "").split(",")
+    if item.strip()
+}
+_deferred_client_tool_profile_cache: Optional[List[Dict[str, Any]]] = None
+
+
+def _load_deferred_tool_sessions() -> None:
+    """Load deferred tool session mapping for client-side tool round-trips."""
+    global _deferred_tool_sessions
+    try:
+        with open(_deferred_tool_store_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _deferred_tool_sessions = {
+                str(k): v for k, v in data.items() if isinstance(v, dict) and v.get("session_id")
+            }
+    except FileNotFoundError:
+        _deferred_tool_sessions = {}
+    except Exception as exc:
+        logger.warning(f"Failed to load deferred tool sessions: {exc}")
+        _deferred_tool_sessions = {}
+
+
+def _save_deferred_tool_sessions() -> None:
+    try:
+        os.makedirs(os.path.dirname(_deferred_tool_store_path), exist_ok=True)
+        with open(_deferred_tool_store_path, "w", encoding="utf-8") as f:
+            json.dump(_deferred_tool_sessions, f)
+    except Exception as exc:
+        logger.warning(f"Failed to save deferred tool sessions: {exc}")
+
+
+def _remember_deferred_tool(
+    tool_call_id: str,
+    session_id: str,
+    client: Optional[ClaudeSDKClient] = None,
+    tool_name_map: Optional[Dict[str, str]] = None,
+) -> None:
+    if not tool_call_id or not session_id:
+        return
+    _deferred_tool_sessions[tool_call_id] = {
+        "session_id": session_id,
+        "created_at": time.time(),
+    }
+    if tool_name_map:
+        _deferred_tool_sessions[tool_call_id]["tool_name_map"] = tool_name_map
+    if client:
+        _deferred_tool_clients[session_id] = client
+        _deferred_tool_locks.setdefault(session_id, asyncio.Lock())
+    _save_deferred_tool_sessions()
+
+
+def _forget_deferred_tool(tool_call_id: Optional[str]) -> None:
+    if tool_call_id and tool_call_id in _deferred_tool_sessions:
+        _deferred_tool_sessions.pop(tool_call_id, None)
+        _save_deferred_tool_sessions()
+
+
+async def _close_deferred_session(session_id: Optional[str]) -> None:
+    if not session_id:
+        return
+    client = _deferred_tool_clients.pop(session_id, None)
+    _deferred_tool_locks.pop(session_id, None)
+    removed = False
+    for tool_call_id, session_info in list(_deferred_tool_sessions.items()):
+        if str(session_info.get("session_id")) == str(session_id):
+            _deferred_tool_sessions.pop(tool_call_id, None)
+            removed = True
+    if removed:
+        _save_deferred_tool_sessions()
+    if client:
+        try:
+            await client.disconnect()
+        except Exception as exc:
+            logger.warning("Failed to disconnect deferred Claude session %s: %s", session_id, exc)
+
+
+async def _prune_expired_deferred_sessions() -> None:
+    now = time.time()
+    session_created_at: Dict[str, float] = {}
+    for session_info in _deferred_tool_sessions.values():
+        session_id = str(session_info.get("session_id") or "")
+        if not session_id:
+            continue
+        created_at = float(session_info.get("created_at") or now)
+        session_created_at[session_id] = min(session_created_at.get(session_id, created_at), created_at)
+
+    for session_id, created_at in list(session_created_at.items()):
+        if now - created_at > _deferred_tool_session_ttl_seconds:
+            logger.info("Closing expired deferred Claude session: %s", session_id)
+            await _close_deferred_session(session_id)
+
+
+async def _defer_tool_hook(input_data, tool_use_id, context):
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "defer",
+        }
+    }
+
+
+def _get_attr_or_key(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tool_input_to_json(value: Any) -> str:
+    try:
+        return json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return "{}"
+
+
+def _json_object_schema() -> Dict[str, Any]:
+    return {"type": "object", "properties": {}, "additionalProperties": True}
+
+
+def _normalize_tool_schema(schema: Any) -> Dict[str, Any]:
+    if not isinstance(schema, dict):
+        return _json_object_schema()
+    if schema.get("type") == "object" or "properties" in schema:
+        normalized = dict(schema)
+        normalized.setdefault("type", "object")
+        normalized.setdefault("properties", {})
+        return normalized
+    return _json_object_schema()
+
+
+def _tool_spec_from_definition(tool_def: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    name = None
+    description = ""
+    schema: Any = None
+
+    function = tool_def.get("function")
+    if tool_def.get("type") == "function" and isinstance(function, dict):
+        name = function.get("name")
+        description = function.get("description") or ""
+        schema = function.get("parameters")
+    else:
+        name = tool_def.get("name")
+        description = tool_def.get("description") or ""
+        schema = (
+            tool_def.get("inputSchema")
+            or tool_def.get("input_schema")
+            or tool_def.get("parameters")
+        )
+
+    if not isinstance(name, str) or not name:
+        return None
+    return {
+        "name": name,
+        "description": description or f"Client Claude Code tool: {name}",
+        "input_schema": _normalize_tool_schema(schema),
+    }
+
+
+def _extract_request_tool_specs(request_body: ChatCompletionRequest) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    seen = set()
+    for tool_def in request_body.tools or []:
+        if not isinstance(tool_def, dict):
+            continue
+        spec = _tool_spec_from_definition(tool_def)
+        if spec and spec["name"] not in seen:
+            specs.append(spec)
+            seen.add(spec["name"])
+    return specs
+
+
+def _extract_request_tool_names(request_body: ChatCompletionRequest) -> List[str]:
+    return [spec["name"] for spec in _extract_request_tool_specs(request_body)]
+
+
+def _default_client_tool_profile_paths() -> List[str]:
+    wrapper_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return [
+        _deferred_client_tool_profile_path,
+        os.path.join(wrapper_root, "client-tools.windows.json"),
+    ]
+
+
+def _load_client_tool_profile() -> List[Dict[str, Any]]:
+    global _deferred_client_tool_profile_cache
+    if _deferred_client_tool_profile_cache is not None:
+        return _deferred_client_tool_profile_cache
+
+    for profile_path in _default_client_tool_profile_paths():
+        if not profile_path:
+            continue
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.warning("Failed to load client tool profile %s: %s", profile_path, exc)
+            continue
+
+        tools = data.get("tools") if isinstance(data, dict) else data
+        if not isinstance(tools, list):
+            continue
+
+        specs: List[Dict[str, Any]] = []
+        for tool_def in tools:
+            if not isinstance(tool_def, dict):
+                continue
+            spec = _tool_spec_from_definition(tool_def)
+            if spec:
+                specs.append(spec)
+        _deferred_client_tool_profile_cache = specs
+        logger.info("Loaded client tool profile %s with %s tools", profile_path, len(specs))
+        return specs
+
+    _deferred_client_tool_profile_cache = []
+    return []
+
+
+def _windows_powershell_tool_spec() -> Dict[str, Any]:
+    return {
+        "name": "PowerShell",
+        "description": (
+            "Executes a given PowerShell command with optional timeout. Working directory "
+            "persists between commands; shell state may persist between calls in the "
+            "Claude Code client."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "PowerShell command to execute"},
+                "timeout": {"type": "number", "description": "Optional timeout in milliseconds"},
+                "description": {
+                    "type": "string",
+                    "description": "Short description of what the command does",
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Whether to run the command in the background",
+                },
+                "dangerouslyDisableSandbox": {
+                    "type": "boolean",
+                    "description": "Disable sandboxing for this command when supported",
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _client_tool_profile_spec(name: str) -> Optional[Dict[str, Any]]:
+    for spec in _load_client_tool_profile():
+        if spec["name"] == name:
+            return spec
+    return None
+
+
+def _client_tool_mirror_enabled() -> bool:
+    return _deferred_tool_mirror_mode not in ("0", "false", "no", "off", "none", "legacy")
+
+
+def _tool_allowed_by_client_profile(name: str) -> bool:
+    if _deferred_client_tool_allowlist and name not in _deferred_client_tool_allowlist:
+        return False
+    if name in _deferred_client_tool_denylist:
+        return False
+    return True
+
+
+def _make_client_mcp_tool(spec: Dict[str, Any]) -> Any:
+    async def _client_tool_stub(args):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "This mirrored Claude Code client tool should have been "
+                        "deferred to the API client for execution."
+                    ),
+                }
+            ],
+            "is_error": True,
+        }
+
+    return sdk_tool(
+        spec["name"],
+        spec.get("description") or f"Client Claude Code tool: {spec['name']}",
+        spec.get("input_schema") or _json_object_schema(),
+    )(_client_tool_stub)
+
+
+def _build_client_tool_mirror(
+    request_body: ChatCompletionRequest,
+) -> Optional[Dict[str, Any]]:
+    if not _client_tool_mirror_enabled():
+        return None
+    if create_sdk_mcp_server is None or sdk_tool is None:
+        logger.warning("Client tool mirror disabled because Claude Agent SDK lacks MCP helpers")
+        return None
+
+    specs_by_name: Dict[str, Dict[str, Any]] = {}
+    request_specs = _extract_request_tool_specs(request_body)
+
+    for spec in request_specs:
+        if _tool_allowed_by_client_profile(spec["name"]):
+            specs_by_name[spec["name"]] = spec
+
+    should_load_profile = (
+        _deferred_client_tool_profile_mode == "merge"
+        or (not request_specs and _deferred_client_tool_profile_mode != "off")
+    )
+    if should_load_profile:
+        for spec in _load_client_tool_profile():
+            if _tool_allowed_by_client_profile(spec["name"]):
+                specs_by_name.setdefault(spec["name"], spec)
+
+    if _deferred_client_platform in ("windows", "win32") and "PowerShell" not in specs_by_name:
+        specs_by_name["PowerShell"] = (
+            _client_tool_profile_spec("PowerShell") or _windows_powershell_tool_spec()
+        )
+
+    if not specs_by_name:
+        return None
+
+    server_name = _deferred_client_tool_server_name or "client"
+    sdk_tools = []
+    internal_to_external: Dict[str, str] = {}
+    for name in sorted(specs_by_name):
+        spec = specs_by_name[name]
+        sdk_tools.append(_make_client_mcp_tool(spec))
+        internal_to_external[f"mcp__{server_name}__{name}"] = name
+
+    return {
+        "server_name": server_name,
+        "server": create_sdk_mcp_server(server_name, tools=sdk_tools),
+        "allowed_tools": list(internal_to_external.keys()),
+        "internal_to_external": internal_to_external,
+        "external_names": sorted(specs_by_name.keys()),
+    }
+
+
+def _client_tool_bridge_prompt(mirror: Optional[Dict[str, Any]]) -> str:
+    if not mirror:
+        return ""
+    external_names = ", ".join(mirror.get("external_names") or [])
+    server_name = mirror.get("server_name") or "client"
+    prefix = f"mcp__{server_name}__"
+    return (
+        "<client_tool_bridge>\n"
+        f"The available {prefix}* tools mirror the user's Claude Code client tools. "
+        "When you call one of them, the call is returned to the Claude Code client and "
+        "executes on the user's machine, not inside this OpenWrt wrapper container. "
+        f"Treat {prefix}PowerShell as the client PowerShell tool, {prefix}Bash "
+        f"as the client Bash tool, and {prefix}Read/Edit/Write/Glob/Grep as the "
+        "client filesystem tools. Prefer PowerShell syntax and Windows paths when the "
+        "client environment is Windows. Do not rewrite user paths into OpenWrt/Linux "
+        "paths just because the bridge process runs on OpenWrt.\n"
+        f"Mirrored client tools: {external_names}\n"
+        "</client_tool_bridge>"
+    )
+
+
+def _map_deferred_tool_name(name: str, tool_name_map: Optional[Dict[str, str]]) -> str:
+    if tool_name_map and name in tool_name_map:
+        return tool_name_map[name]
+    return name
+
+
+def _extract_last_tool_result(request_body: ChatCompletionRequest) -> Optional[Dict[str, Any]]:
+    for msg in reversed(request_body.messages):
+        if msg.role != "tool" or not msg.tool_call_id:
+            continue
+        return {
+            "tool_call_id": msg.tool_call_id,
+            "content": msg.content or "",
+            "is_error": False,
+        }
+    return None
+
+
+async def _tool_result_prompt(session_id: str, tool_result: Dict[str, Any]):
+    yield {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_result["tool_call_id"],
+                    "content": tool_result.get("content") or "",
+                    "is_error": bool(tool_result.get("is_error")),
+                }
+            ],
+        },
+        "parent_tool_use_id": None,
+        "session_id": session_id,
+    }
+
+
+def _sdk_message_to_dict(message: Any) -> Dict[str, Any]:
+    if isinstance(message, dict):
+        return message
+    out: Dict[str, Any] = {"_sdk_type": type(message).__name__}
+    for attr_name in dir(message):
+        if attr_name.startswith("_"):
+            continue
+        try:
+            attr_value = getattr(message, attr_name)
+        except Exception:
+            continue
+        if not callable(attr_value):
+            out[attr_name] = attr_value
+    return out
+
+
+def _is_result_chunk(chunk: Dict[str, Any]) -> bool:
+    return bool(
+        chunk.get("_sdk_type") == "ResultMessage"
+        or (
+            "duration_ms" in chunk
+            and "is_error" in chunk
+            and "num_turns" in chunk
+            and "session_id" in chunk
+        )
+    )
+
+
+async def _receive_until_result(client: ClaudeSDKClient) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+    async for message in client.receive_messages():
+        chunk = _sdk_message_to_dict(message)
+        chunks.append(chunk)
+        if _is_result_chunk(chunk):
+            break
+    return chunks
+
+
+def _build_deferred_client_options(
+    system_prompt: Optional[str],
+    claude_options: Dict[str, Any],
+    tool_names: List[str],
+    client_tool_mirror: Optional[Dict[str, Any]] = None,
+) -> ClaudeAgentOptions:
+    options = ClaudeAgentOptions(max_turns=1, cwd=claude_cli.cwd)
+    model = claude_options.get("model")
+    if model:
+        options.model = model
+    bridge_prompt = _client_tool_bridge_prompt(client_tool_mirror)
+    if system_prompt:
+        options.system_prompt = (
+            f"{system_prompt}\n\n{bridge_prompt}" if bridge_prompt else system_prompt
+        )
+    elif bridge_prompt:
+        options.system_prompt = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": bridge_prompt,
+        }
+    else:
+        options.system_prompt = {"type": "preset", "preset": "claude_code"}
+    if client_tool_mirror:
+        options.tools = []
+        options.mcp_servers = {
+            client_tool_mirror["server_name"]: client_tool_mirror["server"],
+        }
+        options.allowed_tools = client_tool_mirror["allowed_tools"]
+    else:
+        options.allowed_tools = tool_names
+    options.permission_mode = "bypassPermissions"
+    options.hooks = {
+        "PreToolUse": [
+            HookMatcher(hooks=[_defer_tool_hook]),
+        ]
+    }
+    if claude_cli.claude_env_vars:
+        options.env.update(claude_cli.claude_env_vars)
+    apply_claude_agent_reasoning_options(options, claude_options)
+    return options
+
+
+def _reasoning_summary_from_bridge_chunks(chunks: List[Dict[str, Any]]) -> Optional[str]:
+    parts: List[str] = []
+    for chunk in chunks:
+        content = chunk.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            thinking = _get_attr_or_key(block, "thinking")
+            if isinstance(thinking, str) and thinking:
+                parts.append(thinking)
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                text = block.get("thinking") or block.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
+def _text_from_bridge_chunks(chunks: List[Dict[str, Any]]) -> str:
+    for chunk in reversed(chunks):
+        result = chunk.get("result")
+        if isinstance(result, str) and result:
+            return result
+
+    parts: List[str] = []
+    for chunk in chunks:
+        content = chunk.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            text = _get_attr_or_key(block, "text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _deferred_tool_from_chunks(chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    saw_tool_deferred = any(chunk.get("stop_reason") == "tool_deferred" for chunk in chunks)
+    for chunk in chunks:
+        deferred = chunk.get("deferred_tool_use")
+        if deferred and chunk.get("stop_reason") == "tool_deferred":
+            return {
+                "id": str(_get_attr_or_key(deferred, "id", "")),
+                "name": str(_get_attr_or_key(deferred, "name", "")),
+                "input": _get_attr_or_key(deferred, "input", {}) or {},
+                "session_id": chunk.get("session_id"),
+            }
+
+    if not saw_tool_deferred:
+        return None
+
+    for chunk in chunks:
+        content = chunk.get("content")
+        session_id = chunk.get("session_id")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            name = _get_attr_or_key(block, "name")
+            tool_id = _get_attr_or_key(block, "id")
+            tool_input = _get_attr_or_key(block, "input")
+            if name and tool_id:
+                return {
+                    "id": str(tool_id),
+                    "name": str(name),
+                    "input": tool_input or {},
+                    "session_id": session_id,
+                }
+    return None
+
+
+def _usage_from_bridge_chunks(prompt: str, text: str, chunks: List[Dict[str, Any]]) -> Usage:
+    for chunk in reversed(chunks):
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = int(
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+            )
+            output_tokens = int(usage.get("output_tokens") or 0)
+            return Usage(
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+    estimated = claude_cli.estimate_token_usage(prompt, text)
+    return Usage(
+        prompt_tokens=estimated["prompt_tokens"],
+        completion_tokens=estimated["completion_tokens"],
+        total_tokens=estimated["total_tokens"],
+    )
+
+
+async def generate_deferred_tool_chat_response(
+    request_body: ChatCompletionRequest,
+    request_id: str,
+    prompt: str,
+    system_prompt: Optional[str],
+    claude_options: Dict[str, Any],
+) -> ChatCompletionResponse:
+    """Run Claude Code with tools deferred back to the API client."""
+    await _prune_expired_deferred_sessions()
+    tool_result = _extract_last_tool_result(request_body)
+    resume_session_id: Optional[str] = None
+    resolved_tool_call_id: Optional[str] = None
+    client: Optional[ClaudeSDKClient] = None
+    tool_name_map: Dict[str, str] = {}
+
+    if tool_result:
+        resolved_tool_call_id = tool_result["tool_call_id"]
+        session_info = _deferred_tool_sessions.get(resolved_tool_call_id)
+        if not session_info:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No deferred Claude session found for tool_call_id={resolved_tool_call_id}",
+            )
+        resume_session_id = str(session_info["session_id"])
+        stored_tool_name_map = session_info.get("tool_name_map")
+        if isinstance(stored_tool_name_map, dict):
+            tool_name_map = {
+                str(k): str(v)
+                for k, v in stored_tool_name_map.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+        client = _deferred_tool_clients.get(resume_session_id)
+        if not client:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Deferred Claude session is no longer active. "
+                    "Retry the request from the beginning."
+                ),
+            )
+        logger.info(
+            "Continuing deferred tool call: tool_call_id=%s session_id=%s",
+            resolved_tool_call_id,
+            resume_session_id,
+        )
+        lock = _deferred_tool_locks.setdefault(resume_session_id, asyncio.Lock())
+        async with lock:
+            await client.query(
+                _tool_result_prompt(resume_session_id, tool_result),
+                session_id=resume_session_id,
+            )
+            chunks = await _receive_until_result(client)
+    else:
+        tool_names = _extract_request_tool_names(request_body)
+        if not tool_names:
+            tool_names = DEFAULT_ALLOWED_TOOLS
+        client_tool_mirror = _build_client_tool_mirror(request_body)
+        if client_tool_mirror:
+            tool_name_map = client_tool_mirror["internal_to_external"]
+            logger.info(
+                "Deferring mirrored client tools back to API client: %s",
+                client_tool_mirror["external_names"],
+            )
+        else:
+            client_tool_mirror = None
+            logger.info("Deferring tools back to API client: %s", tool_names)
+        claude_options["allowed_tools"] = tool_names
+        client = ClaudeSDKClient(
+            options=_build_deferred_client_options(
+                system_prompt,
+                claude_options,
+                tool_names,
+                client_tool_mirror=client_tool_mirror,
+            )
+        )
+        try:
+            await client.connect()
+            await client.query(prompt)
+            chunks = await _receive_until_result(client)
+        except Exception:
+            await client.disconnect()
+            raise
+
+    deferred = _deferred_tool_from_chunks(chunks)
+    if deferred and deferred.get("id") and deferred.get("name"):
+        session_id = deferred.get("session_id")
+        external_tool_name = _map_deferred_tool_name(deferred["name"], tool_name_map)
+        if session_id:
+            _remember_deferred_tool(
+                deferred["id"],
+                str(session_id),
+                client,
+                tool_name_map=tool_name_map,
+            )
+        if resolved_tool_call_id and resolved_tool_call_id != deferred["id"]:
+            _forget_deferred_tool(resolved_tool_call_id)
+        tool_call = {
+            "id": deferred["id"],
+            "type": "function",
+            "function": {
+                "name": external_tool_name,
+                "arguments": _tool_input_to_json(deferred.get("input")),
+            },
+        }
+        text = _text_from_bridge_chunks(chunks)
+        reasoning_summary = _reasoning_summary_from_bridge_chunks(chunks)
+        usage = _usage_from_bridge_chunks(prompt, text, chunks)
+        return ChatCompletionResponse(
+            id=request_id,
+            model=request_body.model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=Message(
+                        role="assistant",
+                        content=text or None,
+                        tool_calls=[tool_call],
+                        reasoning_content=reasoning_summary,
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=usage,
+        )
+
+    if resume_session_id:
+        await _close_deferred_session(resume_session_id)
+    elif client:
+        await client.disconnect()
+
+    assistant_content = MessageAdapter.filter_content(_text_from_bridge_chunks(chunks))
+    if not assistant_content:
+        assistant_content = "I'm unable to provide a response at the moment."
+    reasoning_summary = _reasoning_summary_from_bridge_chunks(chunks)
+    usage = _usage_from_bridge_chunks(prompt, assistant_content, chunks)
+    return ChatCompletionResponse(
+        id=request_id,
+        model=request_body.model,
+        choices=[
+            Choice(
+                index=0,
+                message=Message(
+                    role="assistant",
+                    content=assistant_content,
+                    reasoning_content=reasoning_summary,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=usage,
+    )
+
+
+async def generate_deferred_tool_streaming_response(
+    request_body: ChatCompletionRequest,
+    request_id: str,
+    prompt: str,
+    system_prompt: Optional[str],
+    claude_options: Dict[str, Any],
+) -> AsyncGenerator[str, None]:
+    task = asyncio.create_task(
+        generate_deferred_tool_chat_response(
+            request_body=request_body,
+            request_id=request_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            claude_options=claude_options,
+        )
+    )
+    yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={'role': 'assistant'}, finish_reason=None)]).model_dump_json()}\n\n"
+    heartbeat_seconds = max(_deferred_tool_stream_heartbeat_seconds, 1.0)
+    while not task.done():
+        done, _pending = await asyncio.wait({task}, timeout=heartbeat_seconds)
+        if done:
+            break
+        yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={'content': ''}, finish_reason=None)]).model_dump_json()}\n\n"
+    response = await task
+    choice = response.choices[0]
+    if choice.message.tool_calls:
+        tool_call = choice.message.tool_calls[0]
+        if choice.message.reasoning_content:
+            yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={'reasoning_content': choice.message.reasoning_content}, finish_reason=None)]).model_dump_json()}\n\n"
+        delta = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": tool_call.get("id"),
+                    "type": "function",
+                    "function": tool_call.get("function") or {},
+                }
+            ]
+        }
+        yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta=delta, finish_reason=None)]).model_dump_json()}\n\n"
+        finish = "tool_calls"
+    else:
+        if choice.message.reasoning_content:
+            yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={'reasoning_content': choice.message.reasoning_content}, finish_reason=None)]).model_dump_json()}\n\n"
+        content = choice.message.content or ""
+        if content:
+            yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={'content': content}, finish_reason=None)]).model_dump_json()}\n\n"
+        finish = choice.finish_reason or "stop"
+    yield f"data: {ChatCompletionStreamResponse(id=request_id, model=request_body.model, choices=[StreamChoice(index=0, delta={}, finish_reason=finish)], usage=response.usage).model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 def _iso_to_unix(value: Any) -> Optional[int]:
@@ -325,6 +1140,7 @@ claude_cli = ClaudeCodeCLI(
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
     logger.info("Verifying Claude Code authentication and CLI...")
+    _load_deferred_tool_sessions()
 
     # Validate authentication first
     auth_valid, auth_info = validate_claude_code_auth()
@@ -396,6 +1212,8 @@ async def lifespan(app: FastAPI):
 
     # Cleanup on shutdown
     logger.info("Shutting down session manager...")
+    for session_id in list(_deferred_tool_clients.keys()):
+        await _close_deferred_session(session_id)
     session_manager.shutdown()
 
 
@@ -627,6 +1445,17 @@ async def generate_streaming_response(
         if claude_options.get("model"):
             ParameterValidator.validate_model(claude_options["model"])
 
+        if request.defer_tools:
+            async for event in generate_deferred_tool_streaming_response(
+                request_body=request,
+                request_id=request_id,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                claude_options=claude_options,
+            ):
+                yield event
+            return
+
         # Handle tools - disabled by default for OpenAI compatibility
         if not request.enable_tools:
             # Disable all tools by using CLAUDE_TOOLS constant
@@ -653,6 +1482,11 @@ async def generate_streaming_response(
             allowed_tools=claude_options.get("allowed_tools"),
             disallowed_tools=claude_options.get("disallowed_tools"),
             permission_mode=claude_options.get("permission_mode"),
+            effort=claude_options.get("effort"),
+            max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+            thinking=claude_options.get("thinking"),
+            settings=claude_options.get("settings"),
+            show_thinking_summaries=claude_options.get("show_thinking_summaries"),
             stream=True,
         ):
             chunks_buffer.append(chunk)
@@ -689,6 +1523,22 @@ async def generate_streaming_response(
                 # Handle content blocks
                 if isinstance(content, list):
                     for block in content:
+                        reasoning_summary = _get_attr_or_key(block, "thinking")
+                        if isinstance(reasoning_summary, str) and reasoning_summary:
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={"reasoning_content": reasoning_summary},
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            continue
+
                         # Handle TextBlock objects from Claude Agent SDK
                         if hasattr(block, "text"):
                             raw_text = block.text
@@ -889,6 +1739,15 @@ async def chat_completions(
             if claude_options.get("model"):
                 ParameterValidator.validate_model(claude_options["model"])
 
+            if request_body.defer_tools:
+                return await generate_deferred_tool_chat_response(
+                    request_body=request_body,
+                    request_id=request_id,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    claude_options=claude_options,
+                )
+
             # Handle tools - disabled by default for OpenAI compatibility
             if not request_body.enable_tools:
                 # Disable all tools by using CLAUDE_TOOLS constant
@@ -912,6 +1771,11 @@ async def chat_completions(
                 allowed_tools=claude_options.get("allowed_tools"),
                 disallowed_tools=claude_options.get("disallowed_tools"),
                 permission_mode=claude_options.get("permission_mode"),
+                effort=claude_options.get("effort"),
+                max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+                thinking=claude_options.get("thinking"),
+                settings=claude_options.get("settings"),
+                show_thinking_summaries=claude_options.get("show_thinking_summaries"),
                 stream=False,
             ):
                 chunks.append(chunk)
@@ -924,6 +1788,7 @@ async def chat_completions(
 
             # Filter out tool usage and thinking blocks
             assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+            reasoning_summary = _reasoning_summary_from_bridge_chunks(chunks)
 
             # Add assistant response to session if using session mode
             if actual_session_id:
@@ -941,7 +1806,11 @@ async def chat_completions(
                 choices=[
                     Choice(
                         index=0,
-                        message=Message(role="assistant", content=assistant_content),
+                        message=Message(
+                            role="assistant",
+                            content=assistant_content,
+                            reasoning_content=reasoning_summary,
+                        ),
                         finish_reason="stop",
                     )
                 ],

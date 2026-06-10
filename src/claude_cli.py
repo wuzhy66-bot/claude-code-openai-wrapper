@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import atexit
 import shutil
@@ -9,6 +10,86 @@ import logging
 from claude_agent_sdk import query, ClaudeAgentOptions
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _normalise_thinking_config(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+
+    thinking_type = str(value.get("type") or "").strip().lower()
+    if thinking_type == "adaptive":
+        return {"type": "adaptive"}
+    if thinking_type == "disabled":
+        return {"type": "disabled"}
+    if thinking_type == "enabled":
+        try:
+            budget_tokens = int(value.get("budget_tokens"))
+        except (TypeError, ValueError):
+            budget_tokens = 0
+        if budget_tokens > 0:
+            return {"type": "enabled", "budget_tokens": budget_tokens}
+    return None
+
+
+def _settings_with_thinking_summaries(settings: Optional[str]) -> str:
+    settings_obj: Dict[str, Any] = {}
+    if settings:
+        settings_text = settings.strip()
+        if settings_text.startswith("{") and settings_text.endswith("}"):
+            try:
+                settings_obj = json.loads(settings_text)
+            except json.JSONDecodeError:
+                logger.warning("Ignoring invalid JSON settings while enabling thinking summaries")
+        else:
+            settings_path = Path(settings_text)
+            if settings_path.exists():
+                try:
+                    settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    logger.warning("Ignoring unreadable settings file while enabling thinking summaries")
+            else:
+                logger.warning("Settings path not found while enabling thinking summaries: %s", settings)
+    settings_obj["showThinkingSummaries"] = True
+    return json.dumps(settings_obj)
+
+
+def apply_claude_agent_reasoning_options(
+    options: ClaudeAgentOptions,
+    claude_options: Dict[str, Any],
+) -> None:
+    """Apply reasoning/thinking options to ClaudeAgentOptions in one place."""
+    effort = claude_options.get("effort")
+    if effort:
+        options.effort = str(effort)
+
+    thinking = _normalise_thinking_config(claude_options.get("thinking"))
+    if thinking:
+        options.thinking = thinking
+    else:
+        max_thinking_tokens = claude_options.get("max_thinking_tokens")
+        if max_thinking_tokens is not None:
+            try:
+                options.max_thinking_tokens = int(max_thinking_tokens)
+            except (TypeError, ValueError):
+                logger.warning("Invalid max_thinking_tokens ignored: %s", max_thinking_tokens)
+
+    settings = claude_options.get("settings")
+    if isinstance(settings, str) and settings:
+        options.settings = settings
+
+    show_summaries = claude_options.get(
+        "show_thinking_summaries",
+        _env_flag("CLAUDE_WRAPPER_SHOW_THINKING_SUMMARIES", True),
+    )
+    if show_summaries:
+        options.settings = _settings_with_thinking_summaries(options.settings)
 
 
 class ClaudeCodeCLI:
@@ -94,7 +175,7 @@ class ClaudeCodeCLI:
 
     async def run_completion(
         self,
-        prompt: str,
+        prompt: Any,
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,
@@ -104,6 +185,13 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         permission_mode: Optional[str] = None,
+        hooks: Optional[Dict[str, Any]] = None,
+        resume: Optional[str] = None,
+        effort: Optional[str] = None,
+        max_thinking_tokens: Optional[int] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        settings: Optional[str] = None,
+        show_thinking_summaries: Optional[bool] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
@@ -122,6 +210,16 @@ class ClaudeCodeCLI:
                 # Set model if specified
                 if model:
                     options.model = model
+                apply_claude_agent_reasoning_options(
+                    options,
+                    {
+                        "effort": effort,
+                        "max_thinking_tokens": max_thinking_tokens,
+                        "thinking": thinking,
+                        "settings": settings,
+                        "show_thinking_summaries": show_thinking_summaries,
+                    },
+                )
 
                 # Set system prompt - CLAUDE AGENT SDK STRUCTURED FORMAT
                 # Use structured format as per SDK documentation
@@ -136,6 +234,8 @@ class ClaudeCodeCLI:
                     options.allowed_tools = allowed_tools
                 if disallowed_tools:
                     options.disallowed_tools = disallowed_tools
+                if hooks:
+                    options.hooks = hooks
 
                 # Set permission mode (needed for tool execution in API context)
                 if permission_mode:
@@ -144,6 +244,8 @@ class ClaudeCodeCLI:
                 # Handle session continuity
                 if continue_session:
                     options.continue_session = True
+                elif resume:
+                    options.resume = resume
                 elif session_id:
                     options.resume = session_id
 

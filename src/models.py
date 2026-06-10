@@ -27,13 +27,19 @@ class ContentPart(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    reasoning_content: Optional[str] = None
+    reasoning_items: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
     def normalize_content(self):
         """Convert array content to string for Claude Code compatibility."""
+        if self.content is None:
+            return self
         if isinstance(self.content, list):
             # Extract text from content parts and concatenate
             text_parts = []
@@ -79,6 +85,26 @@ class ChatCompletionRequest(BaseModel):
     enable_tools: Optional[bool] = Field(
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
+    )
+    defer_tools: Optional[bool] = Field(
+        default=False,
+        description="Return tool calls to the API client instead of executing tools inside the wrapper",
+    )
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="OpenAI-compatible tool definitions",
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="OpenAI-compatible tool choice",
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="OpenAI reasoning effort — mapped to Claude SDK effort per-request",
+    )
+    thinking: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Anthropic thinking config forwarded by the Responses bridge",
     )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
@@ -185,6 +211,30 @@ class ChatCompletionRequest(BaseModel):
         if self.model:
             options["model"] = self.model
 
+        # Map reasoning_effort to Claude SDK effort (per-request)
+        if self.reasoning_effort:
+            options["effort"] = self.reasoning_effort
+            if not self.thinking:
+                options["thinking"] = {"type": "adaptive"}
+            logger.info(f"Mapped reasoning_effort={self.reasoning_effort} to SDK effort")
+
+        if self.thinking:
+            thinking_type = str(self.thinking.get("type") or "").strip().lower()
+            if thinking_type == "adaptive":
+                options["thinking"] = {"type": "adaptive"}
+            elif thinking_type == "disabled":
+                options["thinking"] = {"type": "disabled"}
+            elif thinking_type == "enabled":
+                try:
+                    budget_tokens = int(self.thinking.get("budget_tokens"))
+                except (TypeError, ValueError):
+                    budget_tokens = 0
+                if budget_tokens > 0:
+                    options["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": budget_tokens,
+                    }
+
         # Map max_tokens to max_thinking_tokens (best effort)
         max_token_value = self.max_completion_tokens or self.max_tokens
         if max_token_value is not None:
@@ -206,7 +256,7 @@ class ChatCompletionRequest(BaseModel):
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class Usage(BaseModel):
@@ -228,7 +278,7 @@ class ChatCompletionResponse(BaseModel):
 class StreamChoice(BaseModel):
     index: int
     delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
