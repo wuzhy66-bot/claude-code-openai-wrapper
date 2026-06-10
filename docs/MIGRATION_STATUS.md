@@ -90,7 +90,7 @@ For users deploying the migrated wrapper:
 
 ### Installation
 ```bash
-git clone https://github.com/RichardAtCT/claude-code-openai-wrapper
+git clone https://github.com/wuzhy66-bot/claude-code-openai-wrapper.git
 cd claude-code-openai-wrapper
 git checkout claude/research-api-updates-011CUjNxYatBANZZq6bssaxN
 poetry install

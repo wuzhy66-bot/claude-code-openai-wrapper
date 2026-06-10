@@ -83,7 +83,7 @@ Get started in under 2 minutes:
 
 ```bash
 # 1. Clone and setup the wrapper
-git clone https://github.com/RichardAtCT/claude-code-openai-wrapper
+git clone https://github.com/wuzhy66-bot/claude-code-openai-wrapper.git
 cd claude-code-openai-wrapper
 poetry install  # Installs SDK with bundled Claude Code CLI
 
@@ -127,7 +127,7 @@ poetry run python test_endpoints.py
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/RichardAtCT/claude-code-openai-wrapper
+   git clone https://github.com/wuzhy66-bot/claude-code-openai-wrapper.git
    cd claude-code-openai-wrapper
    ```
 
